@@ -16,6 +16,7 @@ LOVABLE_WEBHOOK_URL = os.environ.get("LOVABLE_WEBHOOK_URL", "")
 POSTS_PER_GROUP = 20
 DELAY_BETWEEN_GROUPS = 5
 COOKIES_FILE = os.environ.get("FB_COOKIES_FILE", None)
+FB_COOKIES = os.environ.get("FB_COOKIES", "")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -23,13 +24,29 @@ logger = logging.getLogger(__name__)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
+def get_cookies_dict():
+    """Parse FB_COOKIES env var into a dict for facebook_scraper."""
+    if FB_COOKIES:
+        try:
+            return json.loads(FB_COOKIES)
+        except json.JSONDecodeError:
+            cookies = {}
+            for pair in FB_COOKIES.split(";"):
+                pair = pair.strip()
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                    cookies[k.strip()] = v.strip()
+            return cookies if cookies else None
+    return None
+
+
 def extract_price(text):
     if not text:
         return None
     patterns = [
-        r'(\d{1,3}(?:,\d{3})+)\s*(?:₪|שח|ש"ח|שקל)',
-        r'(?:₪|שח|ש"ח|שקל)\s*(\d{1,3}(?:,\d{3})+)',
-        r'(\d{4,7})\s*(?:₪|שח|ש"ח|שקל)',
+        r'(\d{1,3}(?:,\d{3})+)\s*(?:₪|שח|\u05e9"ח|שקל)',
+        r'(?:₪|שח|\u05e9"ח|שקל)\s*(\d{1,3}(?:,\d{3})+)',
+        r'(\d{4,7})\s*(?:₪|שח|\u05e9"ח|שקל)',
         r'(?:מחיר|price)\s*:?\s*(\d{1,3}(?:,\d{3})*)'
     ]
     for p in patterns:
@@ -50,9 +67,12 @@ def extract_rooms(text):
 
 
 CITIES = [
-    "תל אביב", "ירושלים", "חיפה", "באר שבע", "רמת גן", "גבעתיים",
-    "פתח תקווה", "ראשון לציון", "חולון", "בת ים", "נתניה", "הרצליה",
-    "רעננה", "כפר סבא", "הוד השרון", "רחובות", "אשדוד", "אשקלון",
+    "תל אביב", "ירושלים", "חיפה", "באר שבע",
+    "רמת גן", "גבעתיים", "פתח תקווה",
+    "ראשון לציון", "חולון", "בת ים",
+    "נתניה", "הרצליה", "רעננה",
+    "כפר סבא", "הוד השרון",
+    "רחובות", "אשדוד", "אשקלון",
     "מודיעין", "בני ברק"
 ]
 
@@ -124,8 +144,15 @@ def scrape_group(group):
     posts = []
     try:
         opts = {"posts_per_page": 5, "allow_extra_requests": False}
-        if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+        cookies_dict = get_cookies_dict()
+        if cookies_dict:
+            opts["cookies"] = cookies_dict
+            logger.info(f"  Using cookies from FB_COOKIES env var")
+        elif COOKIES_FILE and os.path.exists(COOKIES_FILE):
             opts["cookies"] = COOKIES_FILE
+            logger.info(f"  Using cookies from file: {COOKIES_FILE}")
+        else:
+            logger.warning(f"  No cookies available - may not access private groups")
         for post in get_posts(group=gid, pages=POSTS_PER_GROUP // 5, options=opts):
             text = post.get("text") or post.get("post_text") or ""
             pid = post.get("post_id")
@@ -178,6 +205,13 @@ def run_scraper():
         logger.info(f"Lovable webhook configured")
     else:
         logger.warning("LOVABLE_WEBHOOK_URL not set - posts will NOT be forwarded to Lovable")
+    cookies_dict = get_cookies_dict()
+    if cookies_dict:
+        logger.info(f"FB_COOKIES loaded with keys: {list(cookies_dict.keys())}")
+    elif COOKIES_FILE:
+        logger.info(f"Using cookies file: {COOKIES_FILE}")
+    else:
+        logger.warning("No Facebook cookies configured - scraper may not access private groups")
     groups = get_active_groups()
     logger.info(f"Found {len(groups)} active groups")
     total = 0
