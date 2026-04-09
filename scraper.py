@@ -5,17 +5,19 @@ import json
 import logging
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
-from facebook_scraper import get_posts
+
+import requests
+from bs4 import BeautifulSoup
 from supabase import create_client, Client
 
+# ââ Config ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 LOVABLE_WEBHOOK_URL = os.environ.get("LOVABLE_WEBHOOK_URL", "")
 POSTS_PER_GROUP = 20
 DELAY_BETWEEN_GROUPS = 5
-COOKIES_FILE = os.environ.get("FB_COOKIES_FILE", None)
 FB_COOKIES = os.environ.get("FB_COOKIES", "")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -23,9 +25,19 @@ logger = logging.getLogger(__name__)
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+}
 
+# ââ Cookie handling âââââââââââââââââââââââââââââââââââââââââââââââââââââ
 def get_cookies_dict():
-    """Parse FB_COOKIES env var into a dict for facebook_scraper."""
+    """Parse FB_COOKIES env var into a dict."""
     if FB_COOKIES:
         try:
             return json.loads(FB_COOKIES)
@@ -39,74 +51,75 @@ def get_cookies_dict():
             return cookies if cookies else None
     return None
 
-
+# ââ Text extraction helpers âââââââââââââââââââââââââââââââââââââââââââââ
 def extract_price(text):
     if not text:
         return None
     patterns = [
-        r'(\d{1,3}(?:,\d{3})+)\s*(?:₪|שח|\u05e9"ח|שקל)',
-        r'(?:₪|שח|\u05e9"ח|שקל)\s*(\d{1,3}(?:,\d{3})+)',
-        r'(\d{4,7})\s*(?:₪|שח|\u05e9"ח|שקל)',
-        r'(?:מחיר|price)\s*:?\s*(\d{1,3}(?:,\d{3})*)'
+        r'(\d{1,3}(?:,\d{3})*)\s*âª',
+        r'âª\s*(\d{1,3}(?:,\d{3})*)',
+        r'(\d{1,3}(?:,\d{3})*)\s*×©"×',
+        r'(\d{1,3}(?:,\d{3})*)\s*×©×',
+        r'(\d{1,3}(?:,\d{3})*)\s*×©×§×',
+        r'(\d{4,6})\s*(?:×××××©|per month|×?××××©)',
     ]
     for p in patterns:
         m = re.search(p, text)
         if m:
-            try:
-                return float(m.group(1).replace(",", ""))
-            except:
-                continue
+            price_str = m.group(1).replace(",", "")
+            price = int(price_str)
+            if 500 <= price <= 50000:
+                return price
     return None
-
 
 def extract_rooms(text):
     if not text:
         return None
-    m = re.search(r'(\d(?:\.\d)?)\s*חדר', text)
-    return float(m.group(1)) if m else None
-
+    m = re.search(r'(\d(?:\.\d)?)\s*×××¨', text)
+    if m:
+        rooms = float(m.group(1))
+        if 1 <= rooms <= 12:
+            return rooms
+    return None
 
 CITIES = [
-    "תל אביב", "ירושלים", "חיפה", "באר שבע",
-    "רמת גן", "גבעתיים", "פתח תקווה",
-    "ראשון לציון", "חולון", "בת ים",
-    "נתניה", "הרצליה", "רעננה",
-    "כפר סבא", "הוד השרון",
-    "רחובות", "אשדוד", "אשקלון",
-    "מודיעין", "בני ברק"
+    "×ª× ××××", "××¨××©×××", "×××¤×", "×××¨ ×©××¢", "×¨××ª ××", "×××¢×ª×××",
+    "×¤×ª× ×ª×§×××", "×¨××©×× ××¦×××", "×××××", "××ª ××", "× ×ª× ××", "××¨×¦×××",
+    "×¨×¢× × ×", "××¤×¨ ×¡××", "××× ××©×¨××", "×¨×××××ª", "××©×××", "××©×§×××",
+    "×××××¢××", "×× × ××¨×§",
 ]
-
 
 def extract_city(text):
     if not text:
         return None
-    for c in CITIES:
-        if c in text:
-            return c
+    for city in CITIES:
+        if city in text:
+            return city
     return None
-
 
 def extract_listing_type(text):
     if not text:
-        return None
-    for kw in ["להשכרה", "לשכירות", "שכירות", "rent", "לחודש"]:
+        return "rent"
+    sell_kw = ["×××××¨×", "××××¨×", "for sale"]
+    sub_kw = ["×¡××××", "sublet", "×¡×-××"]
+    for kw in sub_kw:
         if kw in text.lower():
-            return "rent"
-    for kw in ["למכירה", "מכירה", "for sale"]:
+            return "sublet"
+    for kw in sell_kw:
         if kw in text.lower():
             return "sale"
-    return None
+    return "rent"
 
-
+# ââ Supabase helpers ââââââââââââââââââââââââââââââââââââââââââââââââââââ
 def get_active_groups():
-    return supabase.table("facebook_groups").select("*").eq("is_active", True).execute().data
-
+    resp = supabase.table("facebook_groups").select("*").eq("is_active", True).execute()
+    return resp.data or []
 
 def extract_group_id(url):
-    m = re.search(r'facebook\.com/groups/([^/?]+)', url)
+    m = re.search(r'groups/([^/?]+)', url)
     return m.group(1) if m else url
 
-
+# ââ Webhook âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 def forward_to_lovable(post_data):
     if not LOVABLE_WEBHOOK_URL:
         return False
@@ -121,14 +134,14 @@ def forward_to_lovable(post_data):
             "rooms": post_data.get("rooms"),
             "listing_type": post_data.get("listing_type"),
             "group_name": post_data.get("group_name", ""),
-            "source": "facebook"
+            "source": "facebook",
         }
-        data = json.dumps(payload).encode('utf-8')
+        data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             LOVABLE_WEBHOOK_URL,
             data=data,
-            headers={'Content-Type': 'application/json'},
-            method='POST'
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
         resp = urllib.request.urlopen(req, timeout=10)
         return resp.status == 200
@@ -136,52 +149,269 @@ def forward_to_lovable(post_data):
         logger.warning(f"  Webhook forward error: {e}")
         return False
 
+# ââ Custom mbasic.facebook.com scraper ââââââââââââââââââââââââââââââââââ
+def fetch_mbasic_page(session, group_id, next_url=None):
+    """Fetch a page from mbasic.facebook.com for a group."""
+    url = next_url or f"https://mbasic.facebook.com/groups/{group_id}"
+    try:
+        resp = session.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
+        if resp.status_code != 200:
+            logger.error(f"  HTTP {resp.status_code} for {url}")
+            return None
+        return resp.text
+    except Exception as e:
+        logger.error(f"  Request error: {e}")
+        return None
 
+def parse_mbasic_posts(html, group_id):
+    """Parse posts from mbasic.facebook.com HTML. Tries multiple strategies."""
+    soup = BeautifulSoup(html, "html.parser")
+    posts = []
+
+    # Check if we got a login page instead of group content
+    if soup.find("input", {"name": "email"}) and soup.find("input", {"name": "pass"}):
+        logger.warning("  Got login page - cookies may be invalid or expired")
+        return posts, None
+
+    # Strategy 1: Find divs with data-ft attribute (traditional mbasic structure)
+    post_containers = soup.find_all("div", attrs={"data-ft": True})
+    if post_containers:
+        logger.info(f"  Strategy 1 (data-ft): found {len(post_containers)} elements")
+        for container in post_containers:
+            post = extract_post_from_container(container, group_id)
+            if post:
+                posts.append(post)
+
+    # Strategy 2: Find article elements
+    if not posts:
+        articles = soup.find_all("article")
+        if articles:
+            logger.info(f"  Strategy 2 (article): found {len(articles)} elements")
+            for article in articles:
+                post = extract_post_from_container(article, group_id)
+                if post:
+                    posts.append(post)
+
+    # Strategy 3: Find story divs by class pattern
+    if not posts:
+        story_divs = soup.find_all("div", class_=re.compile(r"(story|userContent|_5pbx|_3576)"))
+        if story_divs:
+            logger.info(f"  Strategy 3 (story class): found {len(story_divs)} elements")
+            for div in story_divs:
+                post = extract_post_from_container(div, group_id)
+                if post:
+                    posts.append(post)
+
+    # Strategy 4: Find post-like sections by looking for timestamp links
+    if not posts:
+        # On mbasic, each post typically has an <abbr> with timestamp or a link to the post
+        post_links = soup.find_all("a", href=re.compile(r"/groups/\d+/permalink/\d+/|/story\.php\?"))
+        if post_links:
+            logger.info(f"  Strategy 4 (permalink links): found {len(post_links)} links")
+            seen_parents = set()
+            for link in post_links:
+                # Walk up to find the post container
+                parent = link
+                for _ in range(8):
+                    parent = parent.parent
+                    if parent is None:
+                        break
+                    parent_id = id(parent)
+                    if parent_id in seen_parents:
+                        break
+                    # Check if this looks like a post container (has some text)
+                    text = parent.get_text(strip=True)
+                    if len(text) > 50:
+                        seen_parents.add(parent_id)
+                        post = extract_post_from_container(parent, group_id, permalink_link=link)
+                        if post:
+                            posts.append(post)
+                        break
+
+    # Strategy 5: Find all section/div blocks with substantial text content
+    if not posts:
+        # Last resort: look for any div with significant Hebrew text
+        all_divs = soup.find_all(["div", "section"])
+        candidates = []
+        for div in all_divs:
+            text = div.get_text(strip=True)
+            # Look for divs with Hebrew text that look like listings
+            if len(text) > 80 and any(c in text for c in ["×××©××¨×", "×××¨××", "×××¨×", "âª", "×©×××¨××ª"]):
+                candidates.append(div)
+        if candidates:
+            logger.info(f"  Strategy 5 (Hebrew text blocks): found {len(candidates)} candidates")
+            # De-duplicate by checking if one is parent of another
+            for div in candidates[:20]:  # Limit to 20
+                post = extract_post_from_container(div, group_id)
+                if post:
+                    posts.append(post)
+
+    # Debug logging if nothing found
+    if not posts:
+        logger.warning(f"  No posts found with any strategy")
+        # Log HTML structure hints
+        body = soup.find("body")
+        if body:
+            # Log top-level structure
+            children = list(body.children)
+            tag_names = [c.name for c in children if hasattr(c, "name") and c.name]
+            logger.info(f"  Body children tags: {tag_names[:20]}")
+            # Log first 1000 chars of body text
+            body_text = body.get_text(strip=True)[:1000]
+            logger.info(f"  Body text preview: {body_text[:500]}")
+            # Log all div classes
+            all_classes = set()
+            for div in soup.find_all("div", class_=True):
+                for cls in div.get("class", []):
+                    all_classes.add(cls)
+            logger.info(f"  All div classes: {sorted(list(all_classes))[:50]}")
+            # Log all data- attributes
+            data_attrs = set()
+            for tag in soup.find_all(True):
+                for attr in tag.attrs:
+                    if attr.startswith("data-"):
+                        data_attrs.add(attr)
+            logger.info(f"  Data attributes found: {sorted(list(data_attrs))[:30]}")
+
+    # Find next page URL
+    next_page_url = None
+    see_more = soup.find("a", string=re.compile(r"(See More|××¦× ×¢××|×¨×× ×¢××|×¢×× ×¤××¡×××|See more posts)"))
+    if see_more and see_more.get("href"):
+        href = see_more["href"]
+        if href.startswith("/"):
+            next_page_url = f"https://mbasic.facebook.com{href}"
+        elif href.startswith("http"):
+            next_page_url = href
+    # Also look for "See More Posts" link pattern
+    if not next_page_url:
+        more_link = soup.find("a", href=re.compile(r"/groups/.*\?bacr="))
+        if more_link:
+            href = more_link["href"]
+            next_page_url = f"https://mbasic.facebook.com{href}" if href.startswith("/") else href
+
+    return posts, next_page_url
+
+def extract_post_from_container(container, group_id, permalink_link=None):
+    """Extract post data from an HTML container element."""
+    text = container.get_text(separator="\n", strip=True)
+    if not text or len(text) < 20:
+        return None
+
+    # Extract post ID from permalink
+    post_id = None
+    post_url = None
+
+    # Check data-ft attribute for post ID
+    data_ft = container.get("data-ft")
+    if data_ft:
+        try:
+            ft = json.loads(data_ft)
+            post_id = str(ft.get("top_level_post_id", ft.get("tl_objid", "")))
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Find permalink link
+    if not post_id:
+        link = permalink_link or container.find("a", href=re.compile(
+            r"/groups/\d+/permalink/(\d+)|/story\.php\?story_fbid=(\d+)"
+        ))
+        if link:
+            href = link.get("href", "")
+            m = re.search(r"permalink/(\d+)|story_fbid=(\d+)", href)
+            if m:
+                post_id = m.group(1) or m.group(2)
+            if href.startswith("/"):
+                post_url = f"https://facebook.com{href}"
+            else:
+                post_url = href
+
+    if not post_id:
+        # Generate a hash-based ID from text content
+        post_id = f"gen_{abs(hash(text[:200]))}"
+
+    if not post_url:
+        post_url = f"https://facebook.com/{post_id}"
+
+    # Extract images
+    images = []
+    for img in container.find_all("img"):
+        src = img.get("src", "")
+        if src and "scontent" in src and "emoji" not in src.lower():
+            images.append(src)
+
+    # Extract author
+    author = None
+    # On mbasic, author is usually the first <strong> or first link with a profile URL
+    author_tag = container.find("strong")
+    if author_tag:
+        author_link = author_tag.find("a")
+        if author_link:
+            author = author_link.get_text(strip=True)
+    if not author:
+        profile_link = container.find("a", href=re.compile(r"/profile\.php|facebook\.com/[a-zA-Z]"))
+        if profile_link:
+            author = profile_link.get_text(strip=True)
+
+    return {
+        "facebook_post_id": str(post_id),
+        "group_id": group_id if isinstance(group_id, int) else None,
+        "group_name": "",  # Will be set by caller
+        "author_name": author,
+        "post_text": text[:5000],  # Limit text length
+        "post_url": post_url,
+        "images": images,
+        "post_date": datetime.now(timezone.utc).isoformat(),
+        "price": extract_price(text),
+        "city": extract_city(text),
+        "rooms": extract_rooms(text),
+        "listing_type": extract_listing_type(text),
+        "likes_count": 0,
+        "comments_count": 0,
+        "scraped_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+# ââ Main scraping logic ââââââââââââââââââââââââââââââââââââââââââââââââ
 def scrape_group(group):
     gid = extract_group_id(group["group_url"])
     name = group.get("group_name", gid)
-    logger.info(f"Scraping: {name}")
-    posts = []
-    try:
-        opts = {"posts_per_page": 5, "allow_extra_requests": False}
-        cookies_dict = get_cookies_dict()
-        if cookies_dict:
-            opts["cookies"] = cookies_dict
-            logger.info(f"  Using cookies from FB_COOKIES env var")
-        elif COOKIES_FILE and os.path.exists(COOKIES_FILE):
-            opts["cookies"] = COOKIES_FILE
-            logger.info(f"  Using cookies from file: {COOKIES_FILE}")
-        else:
-            logger.warning(f"  No cookies available - may not access private groups")
-        for post in get_posts(group=gid, pages=POSTS_PER_GROUP // 5, options=opts):
-            text = post.get("text") or post.get("post_text") or ""
-            pid = post.get("post_id")
-            if not pid:
-                continue
-            imgs = list(post.get("images", [])) if post.get("images") else (
-                [post["image"]] if post.get("image") else [])
-            posts.append({
-                "facebook_post_id": str(pid),
-                "group_id": group["id"],
-                "group_name": name,
-                "author_name": post.get("username"),
-                "post_text": text,
-                "post_url": post.get("post_url", f"https://facebook.com/{pid}"),
-                "images": imgs,
-                "post_date": post.get("time", datetime.utcnow()).isoformat() if post.get("time") else None,
-                "price": extract_price(text),
-                "city": extract_city(text),
-                "rooms": extract_rooms(text),
-                "listing_type": extract_listing_type(text),
-                "likes_count": post.get("likes", 0) or 0,
-                "comments_count": post.get("comments", 0) or 0,
-                "scraped_at": datetime.utcnow().isoformat()
-            })
-        logger.info(f"  Found {len(posts)} posts")
-    except Exception as e:
-        logger.error(f"  Error: {e}")
-    return posts
+    logger.info(f"Scraping: {name} (id={gid})")
 
+    cookies_dict = get_cookies_dict()
+    if not cookies_dict:
+        logger.warning("  No cookies available - cannot scrape")
+        return []
+
+    session = requests.Session()
+    session.cookies.update(cookies_dict)
+
+    all_posts = []
+    next_url = None
+    pages_fetched = 0
+    max_pages = POSTS_PER_GROUP // 5  # ~4 pages
+
+    while pages_fetched < max_pages:
+        html = fetch_mbasic_page(session, gid, next_url)
+        if not html:
+            break
+
+        if pages_fetched == 0:
+            logger.info(f"  HTML length: {len(html)} chars")
+
+        posts, next_url = parse_mbasic_posts(html, group["id"])
+
+        for p in posts:
+            p["group_name"] = name
+            p["group_id"] = group["id"]
+
+        all_posts.extend(posts)
+        pages_fetched += 1
+
+        if not next_url:
+            break
+        time.sleep(1)  # Be polite between pages
+
+    logger.info(f"  Found {len(all_posts)} posts across {pages_fetched} pages")
+    return all_posts
 
 def save_posts(posts):
     saved = 0
@@ -198,41 +428,50 @@ def save_posts(posts):
         logger.info(f"  Forwarded {forwarded}/{saved} posts to Lovable")
     return saved
 
-
 def run_scraper():
-    logger.info("Starting scrape...")
+    logger.info("Starting scrape (custom mbasic scraper)...")
     if LOVABLE_WEBHOOK_URL:
         logger.info(f"Lovable webhook configured")
     else:
-        logger.warning("LOVABLE_WEBHOOK_URL not set - posts will NOT be forwarded to Lovable")
+        logger.warning("LOVABLE_WEBHOOK_URL not set")
     cookies_dict = get_cookies_dict()
     if cookies_dict:
         logger.info(f"FB_COOKIES loaded with keys: {list(cookies_dict.keys())}")
-    elif COOKIES_FILE:
-        logger.info(f"Using cookies file: {COOKIES_FILE}")
     else:
-        logger.warning("No Facebook cookies configured - scraper may not access private groups")
+        logger.warning("No Facebook cookies configured - scraping will fail")
+        return
+
     groups = get_active_groups()
     logger.info(f"Found {len(groups)} active groups")
+
     total = 0
     for i, g in enumerate(groups):
         posts = scrape_group(g)
         total += save_posts(posts)
         supabase.table("facebook_groups").update(
-            {"last_scraped_at": datetime.utcnow().isoformat()}
+            {"last_scraped_at": datetime.now(timezone.utc).isoformat()}
         ).eq("id", g["id"]).execute()
         if i < len(groups) - 1:
             time.sleep(DELAY_BETWEEN_GROUPS)
-    logger.info(f"Done! Saved {total} posts from {len(groups)} groups")
+        # Log progress every 10 groups
+        if (i + 1) % 10 == 0:
+            logger.info(f"Progress: {i + 1}/{len(groups)} groups scraped, {total} posts saved")
 
+    logger.info(f"Done! Saved {total} posts from {len(groups)} groups")
 
 def add_group(url, name=None):
     gid = extract_group_id(url)
-    supabase.table("facebook_groups").upsert(
-        {"group_url": url, "group_name": name or gid, "is_active": True},
-        on_conflict="group_url"
-    ).execute()
-
+    data = {
+        "group_url": url,
+        "group_id": gid,
+        "group_name": name or gid,
+        "is_active": True,
+    }
+    try:
+        supabase.table("facebook_groups").upsert(data, on_conflict="group_id").execute()
+        logger.info(f"Added group: {name or gid}")
+    except Exception as e:
+        logger.error(f"Failed to add group: {e}")
 
 if __name__ == "__main__":
     import sys
