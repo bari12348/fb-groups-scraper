@@ -5,6 +5,7 @@ import json
 import logging
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -12,13 +13,14 @@ import requests
 from bs4 import BeautifulSoup
 from supabase import create_client, Client
 
-# ââ Config ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ── Config ──────────────────────────────────────────────────────────────
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 LOVABLE_WEBHOOK_URL = os.environ.get("LOVABLE_WEBHOOK_URL", "")
 POSTS_PER_GROUP = 20
 DELAY_BETWEEN_GROUPS = 5
 FB_COOKIES = os.environ.get("FB_COOKIES", "")
+PROXY_URL = os.environ.get("PROXY_URL", "")  # e.g. http://user:pass@host:port
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -35,33 +37,37 @@ HEADERS = {
     "Sec-Fetch-Site": "none",
 }
 
-# ââ Cookie handling âââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ── Cookie handling ─────────────────────────────────────────────────────
 def get_cookies_dict():
-    """Parse FB_COOKIES env var into a dict."""
+    """Parse FB_COOKIES env var into a dict. URL-decodes values for proper sending."""
     if FB_COOKIES:
         try:
-            return json.loads(FB_COOKIES)
+            raw = json.loads(FB_COOKIES)
         except json.JSONDecodeError:
-            cookies = {}
+            raw = {}
             for pair in FB_COOKIES.split(";"):
                 pair = pair.strip()
                 if "=" in pair:
                     k, v = pair.split("=", 1)
-                    cookies[k.strip()] = v.strip()
-            return cookies if cookies else None
+                    raw[k.strip()] = v.strip()
+        if raw:
+            # URL-decode values (e.g. %3A → :) so cookies match what browser sends
+            decoded = {k: urllib.parse.unquote(v) for k, v in raw.items()}
+            logger.info(f"  Cookies decoded: xs starts with '{decoded.get('xs','')[:20]}...'")
+            return decoded
     return None
 
-# ââ Text extraction helpers âââââââââââââââââââââââââââââââââââââââââââââ
+# ── Text extraction helpers ─────────────────────────────────────────────
 def extract_price(text):
     if not text:
         return None
     patterns = [
-        r'(\d{1,3}(?:,\d{3})*)\s*âª',
-        r'âª\s*(\d{1,3}(?:,\d{3})*)',
-        r'(\d{1,3}(?:,\d{3})*)\s*×©"×',
-        r'(\d{1,3}(?:,\d{3})*)\s*×©×',
-        r'(\d{1,3}(?:,\d{3})*)\s*×©×§×',
-        r'(\d{4,6})\s*(?:×××××©|per month|×?××××©)',
+        r'(\d{1,3}(?:,\d{3})*)\s*₪',
+        r'₪\s*(\d{1,3}(?:,\d{3})*)',
+        r'(\d{1,3}(?:,\d{3})*)\s*ש"ח',
+        r'(\d{1,3}(?:,\d{3})*)\s*שח',
+        r'(\d{1,3}(?:,\d{3})*)\s*שקל',
+        r'(\d{4,6})\s*(?:לחודש|per month|ל?חודש)',
     ]
     for p in patterns:
         m = re.search(p, text)
@@ -75,7 +81,7 @@ def extract_price(text):
 def extract_rooms(text):
     if not text:
         return None
-    m = re.search(r'(\d(?:\.\d)?)\s*×××¨', text)
+    m = re.search(r'(\d(?:\.\d)?)\s*חדר', text)
     if m:
         rooms = float(m.group(1))
         if 1 <= rooms <= 12:
@@ -83,10 +89,10 @@ def extract_rooms(text):
     return None
 
 CITIES = [
-    "×ª× ××××", "××¨××©×××", "×××¤×", "×××¨ ×©××¢", "×¨××ª ××", "×××¢×ª×××",
-    "×¤×ª× ×ª×§×××", "×¨××©×× ××¦×××", "×××××", "××ª ××", "× ×ª× ××", "××¨×¦×××",
-    "×¨×¢× × ×", "××¤×¨ ×¡××", "××× ××©×¨××", "×¨×××××ª", "××©×××", "××©×§×××",
-    "×××××¢××", "×× × ××¨×§",
+    "תל אביב", "ירושלים", "חיפה", "באר שבע", "רמת גן", "גבעתיים",
+    "פתח תקווה", "ראשון לציון", "חולון", "בת ים", "נתניה", "הרצליה",
+    "רעננה", "כפר סבא", "הוד השרון", "רחובות", "אשדוד", "אשקלון",
+    "מודיעין", "בני ברק",
 ]
 
 def extract_city(text):
@@ -100,8 +106,8 @@ def extract_city(text):
 def extract_listing_type(text):
     if not text:
         return "rent"
-    sell_kw = ["×××××¨×", "××××¨×", "for sale"]
-    sub_kw = ["×¡××××", "sublet", "×¡×-××"]
+    sell_kw = ["למכירה", "מכירה", "for sale"]
+    sub_kw = ["סאבלט", "sublet", "סב-לט"]
     for kw in sub_kw:
         if kw in text.lower():
             return "sublet"
@@ -110,7 +116,7 @@ def extract_listing_type(text):
             return "sale"
     return "rent"
 
-# ââ Supabase helpers ââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ── Supabase helpers ────────────────────────────────────────────────────
 def get_active_groups():
     resp = supabase.table("facebook_groups").select("*").eq("is_active", True).execute()
     return resp.data or []
@@ -119,7 +125,7 @@ def extract_group_id(url):
     m = re.search(r'groups/([^/?]+)', url)
     return m.group(1) if m else url
 
-# ââ Webhook âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ── Webhook ─────────────────────────────────────────────────────────────
 def forward_to_lovable(post_data):
     if not LOVABLE_WEBHOOK_URL:
         return False
@@ -149,7 +155,7 @@ def forward_to_lovable(post_data):
         logger.warning(f"  Webhook forward error: {e}")
         return False
 
-# ââ Custom mbasic.facebook.com scraper ââââââââââââââââââââââââââââââââââ
+# ── Custom mbasic.facebook.com scraper ──────────────────────────────────
 def fetch_mbasic_page(session, group_id, next_url=None):
     """Fetch a page from mbasic.facebook.com for a group. Falls back to m.facebook.com."""
     urls_to_try = []
@@ -173,7 +179,7 @@ def fetch_mbasic_page(session, group_id, next_url=None):
                 continue
 
             # Check if we got a splash page (no real content)
-            if "splashScreenAttribution" in resp.text and len(urls_to_try) > 1:
+            if "splashScreenAttribution" in resp.text:
                 logger.warning(f"  Got splash page from {url}, trying next...")
                 continue
 
@@ -256,7 +262,7 @@ def parse_mbasic_posts(html, group_id):
         for div in all_divs:
             text = div.get_text(strip=True)
             # Look for divs with Hebrew text that look like listings
-            if len(text) > 80 and any(c in text for c in ["×××©××¨×", "×××¨××", "×××¨×", "âª", "×©×××¨××ª"]):
+            if len(text) > 80 and any(c in text for c in ["להשכרה", "חדרים", "דירה", "₪", "שכירות"]):
                 candidates.append(div)
         if candidates:
             logger.info(f"  Strategy 5 (Hebrew text blocks): found {len(candidates)} candidates")
@@ -295,7 +301,7 @@ def parse_mbasic_posts(html, group_id):
 
     # Find next page URL
     next_page_url = None
-    see_more = soup.find("a", string=re.compile(r"(See More|××¦× ×¢××|×¨×× ×¢××|×¢×× ×¤××¡×××|See more posts)"))
+    see_more = soup.find("a", string=re.compile(r"(See More|הצג עוד|ראו עוד|עוד פוסטים|See more posts)"))
     if see_more and see_more.get("href"):
         href = see_more["href"]
         if href.startswith("/"):
@@ -390,7 +396,7 @@ def extract_post_from_container(container, group_id, permalink_link=None):
         "scraped_at": datetime.now(timezone.utc).isoformat(),
     }
 
-# ââ Main scraping logic ââââââââââââââââââââââââââââââââââââââââââââââââ
+# ── Main scraping logic ────────────────────────────────────────────────
 def scrape_group(group):
     gid = extract_group_id(group["group_url"])
     name = group.get("group_name", gid)
@@ -402,6 +408,12 @@ def scrape_group(group):
         return []
 
     session = requests.Session()
+
+    # Set proxy if configured
+    if PROXY_URL:
+        session.proxies = {"http": PROXY_URL, "https": PROXY_URL}
+        logger.info(f"  Using proxy: {PROXY_URL[:30]}...")
+
     # Set cookies both ways: cookie jar with domain AND raw Cookie header
     cookie_str = "; ".join(f"{k}={v}" for k, v in cookies_dict.items())
     for key, value in cookies_dict.items():
