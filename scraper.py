@@ -151,17 +151,37 @@ def forward_to_lovable(post_data):
 
 # ââ Custom mbasic.facebook.com scraper ââââââââââââââââââââââââââââââââââ
 def fetch_mbasic_page(session, group_id, next_url=None):
-    """Fetch a page from mbasic.facebook.com for a group."""
-    url = next_url or f"https://mbasic.facebook.com/groups/{group_id}"
-    try:
-        resp = session.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
-        if resp.status_code != 200:
-            logger.error(f"  HTTP {resp.status_code} for {url}")
-            return None
-        return resp.text
-    except Exception as e:
-        logger.error(f"  Request error: {e}")
-        return None
+    """Fetch a page from mbasic.facebook.com for a group. Falls back to m.facebook.com."""
+    urls_to_try = []
+    if next_url:
+        urls_to_try.append(next_url)
+    else:
+        urls_to_try.append(f"https://mbasic.facebook.com/groups/{group_id}")
+        urls_to_try.append(f"https://m.facebook.com/groups/{group_id}")
+
+    # Log cookies being sent (first call only for debugging)
+    cookie_names = [c.name for c in session.cookies]
+    logger.info(f"  Cookies on session: {cookie_names}")
+
+    for url in urls_to_try:
+        try:
+            logger.info(f"  Trying: {url}")
+            resp = session.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
+            logger.info(f"  Response URL: {resp.url} (status={resp.status_code})")
+            if resp.status_code != 200:
+                logger.error(f"  HTTP {resp.status_code} for {url}")
+                continue
+
+            # Check if we got a splash page (no real content)
+            if "splashScreenAttribution" in resp.text and len(urls_to_try) > 1:
+                logger.warning(f"  Got splash page from {url}, trying next...")
+                continue
+
+            return resp.text
+        except Exception as e:
+            logger.error(f"  Request error for {url}: {e}")
+            continue
+    return None
 
 def parse_mbasic_posts(html, group_id):
     """Parse posts from mbasic.facebook.com HTML. Tries multiple strategies."""
@@ -382,7 +402,13 @@ def scrape_group(group):
         return []
 
     session = requests.Session()
-    session.cookies.update(cookies_dict)
+    # Set cookies both ways: cookie jar with domain AND raw Cookie header
+    cookie_str = "; ".join(f"{k}={v}" for k, v in cookies_dict.items())
+    for key, value in cookies_dict.items():
+        session.cookies.set(key, value, domain=".facebook.com")
+    # Also set Cookie header directly as fallback
+    session.headers.update({"Cookie": cookie_str})
+    logger.info(f"  Cookie header set: {cookie_str[:80]}...")
 
     all_posts = []
     next_url = None
