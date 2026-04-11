@@ -156,6 +156,96 @@ def forward_to_lovable(post_data):
         return False
 
 # ── Custom mbasic.facebook.com scraper ──────────────────────────────────
+def handle_splash_page(session, html, base_url):
+    """Try to bypass Facebook splash/interstitial page by following forms or links."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Strategy 1: Find a form with a "Continue" or similar submit button
+    forms = soup.find_all("form")
+    for form in forms:
+        action = form.get("action", "")
+        # Look for forms that seem to be "continue" or "accept" forms
+        submit_btn = form.find("input", {"type": "submit"})
+        if submit_btn or action:
+            form_data = {}
+            for inp in form.find_all("input"):
+                name = inp.get("name")
+                value = inp.get("value", "")
+                if name:
+                    form_data[name] = value
+
+            if action.startswith("/"):
+                # Determine base domain from base_url
+                from urllib.parse import urlparse
+                parsed = urlparse(base_url)
+                form_url = f"{parsed.scheme}://{parsed.netloc}{action}"
+            elif action.startswith("http"):
+                form_url = action
+            else:
+                form_url = base_url
+
+            logger.info(f"  Splash bypass: submitting form to {form_url[:80]}...")
+            try:
+                resp2 = session.post(form_url, data=form_data, headers=HEADERS, timeout=20, allow_redirects=True)
+                if resp2.status_code == 200 and "splashScreenAttribution" not in resp2.text:
+                    logger.info(f"  Splash bypass SUCCESS via form submit!")
+                    return resp2.text
+            except Exception as e:
+                logger.warning(f"  Splash form submit error: {e}")
+
+    # Strategy 2: Find "Continue" / "המשך" links
+    continue_patterns = [r'Continue', r'המשך', r'OK', r'Confirm', r'אישור']
+    for pattern in continue_patterns:
+        link = soup.find("a", string=re.compile(pattern, re.IGNORECASE))
+        if link and link.get("href"):
+            href = link["href"]
+            if href.startswith("/"):
+                from urllib.parse import urlparse
+                parsed = urlparse(base_url)
+                href = f"{parsed.scheme}://{parsed.netloc}{href}"
+            logger.info(f"  Splash bypass: following '{pattern}' link to {href[:80]}...")
+            try:
+                resp2 = session.get(href, headers=HEADERS, timeout=20, allow_redirects=True)
+                if resp2.status_code == 200 and "splashScreenAttribution" not in resp2.text:
+                    logger.info(f"  Splash bypass SUCCESS via link!")
+                    return resp2.text
+            except Exception as e:
+                logger.warning(f"  Splash link follow error: {e}")
+
+    # Strategy 3: Look for meta refresh or redirect URL in the page
+    meta_refresh = soup.find("meta", attrs={"http-equiv": re.compile(r"refresh", re.I)})
+    if meta_refresh:
+        content = meta_refresh.get("content", "")
+        m = re.search(r'url=(.+)', content, re.I)
+        if m:
+            redirect_url = m.group(1).strip()
+            if redirect_url.startswith("/"):
+                from urllib.parse import urlparse
+                parsed = urlparse(base_url)
+                redirect_url = f"{parsed.scheme}://{parsed.netloc}{redirect_url}"
+            logger.info(f"  Splash bypass: following meta refresh to {redirect_url[:80]}...")
+            try:
+                resp2 = session.get(redirect_url, headers=HEADERS, timeout=20, allow_redirects=True)
+                if resp2.status_code == 200:
+                    logger.info(f"  Splash bypass SUCCESS via meta refresh!")
+                    return resp2.text
+            except Exception as e:
+                logger.warning(f"  Meta refresh error: {e}")
+
+    # Strategy 4: Log splash page details for debugging
+    logger.warning(f"  Could not bypass splash page. Forms found: {len(forms)}")
+    # Log form actions for debugging
+    for i, form in enumerate(forms):
+        logger.info(f"  Form {i}: action={form.get('action', 'none')[:100]}")
+        inputs = [(inp.get('name'), inp.get('type'), inp.get('value', '')[:30]) for inp in form.find_all('input')]
+        logger.info(f"  Form {i} inputs: {inputs[:10]}")
+    # Log links that might be useful
+    all_links = soup.find_all("a", href=True)
+    for link in all_links[:10]:
+        logger.info(f"  Link: {link.get_text(strip=True)[:50]} -> {link['href'][:100]}")
+
+    return None
+
 def fetch_mbasic_page(session, group_id, next_url=None):
     """Fetch a page from mbasic.facebook.com for a group. Falls back to m.facebook.com."""
     urls_to_try = []
@@ -180,7 +270,11 @@ def fetch_mbasic_page(session, group_id, next_url=None):
 
             # Check if we got a splash page (no real content)
             if "splashScreenAttribution" in resp.text:
-                logger.warning(f"  Got splash page from {url}, trying next...")
+                logger.warning(f"  Got splash page from {url}, trying to bypass...")
+                bypassed = handle_splash_page(session, resp.text, url)
+                if bypassed:
+                    return bypassed
+                logger.warning(f"  Splash bypass failed for {url}, trying next...")
                 continue
 
             return resp.text
