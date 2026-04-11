@@ -259,11 +259,37 @@ def fetch_mbasic_page(session, group_id, next_url=None):
     cookie_names = [c.name for c in session.cookies]
     logger.info(f"  Cookies on session: {cookie_names}")
 
+    # Use a simpler User-Agent that mbasic accepts better
+    mbasic_headers = HEADERS.copy()
+    mbasic_headers["User-Agent"] = (
+        "Mozilla/5.0 (Linux; U; Android 4.0.3; en-us; KFTT Build/IML74K) "
+        "AppleWebKit/535.19 (KHTML, like Gecko) Silk/3.4 Mobile Safari/535.19"
+    )
+
     for url in urls_to_try:
         try:
             logger.info(f"  Trying: {url}")
-            resp = session.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
-            logger.info(f"  Response URL: {resp.url} (status={resp.status_code})")
+            # First try without following redirects to keep mbasic
+            resp = session.get(url, headers=mbasic_headers, timeout=20, allow_redirects=False)
+            logger.info(f"  Initial response: status={resp.status_code}, Location={resp.headers.get('Location', 'none')[:120]}")
+
+            # If redirect, check where it goes
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("Location", "")
+                # If redirect stays on mbasic, follow it
+                if "mbasic.facebook.com" in location:
+                    logger.info(f"  Following mbasic redirect...")
+                    resp = session.get(location, headers=mbasic_headers, timeout=20, allow_redirects=True)
+                elif "m.facebook.com" in location or "www.facebook.com" in location:
+                    # Facebook is redirecting away from mbasic - still follow but log it
+                    logger.warning(f"  Redirected from mbasic to m/www.facebook.com")
+                    resp = session.get(url, headers=mbasic_headers, timeout=20, allow_redirects=True)
+                else:
+                    # Follow any other redirect
+                    resp = session.get(location, headers=mbasic_headers, timeout=20, allow_redirects=True)
+
+            logger.info(f"  Final URL: {resp.url} (status={resp.status_code}), HTML length: {len(resp.text)}")
+
             if resp.status_code != 200:
                 logger.error(f"  HTTP {resp.status_code} for {url}")
                 continue
@@ -276,6 +302,21 @@ def fetch_mbasic_page(session, group_id, next_url=None):
                     return bypassed
                 logger.warning(f"  Splash bypass failed for {url}, trying next...")
                 continue
+
+            # Check if we got redirected to m.facebook.com (React SPA)
+            if "mbasic.facebook.com" not in resp.url and "mbasic" in url:
+                logger.warning(f"  Got redirected from mbasic to {resp.url[:80]}")
+                # Still return it - parse_mbasic_posts will try to extract embedded data
+                # But also try a direct mbasic request with different approach
+                # Try adding noscript parameter
+                noscript_url = url + ("&" if "?" in url else "?") + "refid=18&_rdr"
+                try:
+                    resp2 = session.get(noscript_url, headers=mbasic_headers, timeout=20, allow_redirects=True)
+                    if resp2.status_code == 200 and "mbasic.facebook.com" in resp2.url:
+                        logger.info(f"  Noscript URL worked! Got mbasic content")
+                        return resp2.text
+                except Exception:
+                    pass
 
             return resp.text
         except Exception as e:
@@ -365,6 +406,72 @@ def parse_mbasic_posts(html, group_id):
                 post = extract_post_from_container(div, group_id)
                 if post:
                     posts.append(post)
+
+    # Strategy 6: Extract embedded JSON data from m.facebook.com script tags
+    if not posts:
+        scripts = soup.find_all("script")
+        for script in scripts:
+            script_text = script.string or ""
+            # Look for embedded post data in various JSON patterns
+            # m.facebook.com embeds data in require() calls or JSON blobs
+            post_matches = re.findall(
+                r'"message"\s*:\s*\{[^}]*"text"\s*:\s*"([^"]{50,})"',
+                script_text
+            )
+            if post_matches:
+                logger.info(f"  Strategy 6 (embedded JSON): found {len(post_matches)} text blocks")
+                for i, text in enumerate(post_matches[:20]):
+                    # Unescape JSON string
+                    text = text.replace("\\n", "\n").replace('\\"', '"').replace("\\u0025", "%")
+                    post_data = {
+                        "facebook_post_id": f"json_{abs(hash(text[:200]))}",
+                        "group_id": group_id if isinstance(group_id, int) else None,
+                        "group_name": "",
+                        "author_name": None,
+                        "post_text": text[:5000],
+                        "post_url": f"https://facebook.com/groups/{group_id}",
+                        "images": [],
+                        "post_date": datetime.now(timezone.utc).isoformat(),
+                        "price": extract_price(text),
+                        "city": extract_city(text),
+                        "rooms": extract_rooms(text),
+                        "listing_type": extract_listing_type(text),
+                        "likes_count": 0,
+                        "comments_count": 0,
+                        "scraped_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    posts.append(post_data)
+
+    # Strategy 7: Try regex on raw HTML for any Hebrew text blocks between tags
+    if not posts:
+        # Find substantial Hebrew text blocks in the raw HTML
+        hebrew_blocks = re.findall(
+            r'>([^<]{80,})<',
+            html
+        )
+        hebrew_posts = [b for b in hebrew_blocks if any(c in b for c in ["להשכרה", "חדרים", "דירה", "₪", "שכירות"])]
+        if hebrew_posts:
+            logger.info(f"  Strategy 7 (raw HTML Hebrew): found {len(hebrew_posts)} text blocks")
+            for text in hebrew_posts[:20]:
+                text = text.strip()
+                post_data = {
+                    "facebook_post_id": f"raw_{abs(hash(text[:200]))}",
+                    "group_id": group_id if isinstance(group_id, int) else None,
+                    "group_name": "",
+                    "author_name": None,
+                    "post_text": text[:5000],
+                    "post_url": f"https://facebook.com/groups/{group_id}",
+                    "images": [],
+                    "post_date": datetime.now(timezone.utc).isoformat(),
+                    "price": extract_price(text),
+                    "city": extract_city(text),
+                    "rooms": extract_rooms(text),
+                    "listing_type": extract_listing_type(text),
+                    "likes_count": 0,
+                    "comments_count": 0,
+                    "scraped_at": datetime.now(timezone.utc).isoformat(),
+                }
+                posts.append(post_data)
 
     # Debug logging if nothing found
     if not posts:
